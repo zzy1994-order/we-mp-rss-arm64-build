@@ -95,12 +95,16 @@ jobs:
             --notes "真 arm64 构建产物，供极空间网页导入。tag: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
 
       - name: Push to Docker Hub (optional)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' && secrets.DH_IMAGE != '' }}
+        # 注意：secrets 上下文不能出现在 if: 条件里（GitHub 限制），故改在 step 体内用 shell 判断
         env:
           DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DH_IMAGE: ${{ secrets.DH_IMAGE }}
         run: |
-          echo "$DH_TOKEN" | docker login -u "$DH_USERNAME" --password-stdin
-          docker tag ghcr.nju.edu.cn/rachelos/we-mp-rss:latest "$DH_IMAGE"
-          docker push "$DH_IMAGE"
+          if [ -n "${DH_USERNAME:-}" ] && [ -n "${DH_TOKEN:-}" ] && [ -n "${DH_IMAGE:-}" ]; then
+            echo "$DH_TOKEN" | docker login -u "$DH_USERNAME" --password-stdin
+            docker tag ghcr.nju.edu.cn/rachelos/we-mp-rss:latest "$DH_IMAGE"
+            docker push "$DH_IMAGE"
+          else
+            echo "未配置 Docker Hub secrets，跳过推送（不影响镜像产物）"
+          fi
