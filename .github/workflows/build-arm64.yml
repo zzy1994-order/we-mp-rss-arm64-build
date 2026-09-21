@@ -1,0 +1,106 @@
+# ===============================================================
+# we-mp-rss 真 arm64 镜像 · 云端构建（全程浏览器可操作，无需 SSH / 无需 NAS 命令行）
+# ---------------------------------------------------------------
+# 本仓库只放「构建配置」3 个文件：Dockerfile / .dockerignore / 本文件。
+# 构建时由本 workflow 在云端 clone 上游 rachelos/we-mp-rss 源码作为构建上下文主体，
+# 仅用本仓库的 Dockerfile（基础镜像改为 python:3.13-slim-bookworm，真 arm64）覆盖之。
+#
+# 用法：
+#   1) 建一个 GitHub 仓库（建议 public，便于 Release URL 导入），把本仓库 3 个文件放进去
+#   2) Actions → build-we-mp-rss-arm64 → Run workflow（可勾 publish_release）
+#   3) 跑完下载 Artifacts/Releases 里的 we-mp-rss-arm64.tar.gz（约 0.9–1.5 GB）
+#   4) 极空间网页 → Docker → 镜像 → 导入 → 选这个 tar.gz
+#   5) compose 中 image 名是 ghcr.nju.edu.cn/rachelos/we-mp-rss:latest，导入后本地即存在该
+#      tag，docker compose up -d 不会联网。
+#
+# 为什么是「真 arm64」：上游 arm64 层实为 amd64 二进制（buildx CI bug），ARM 上必
+#   exec format error；本 Dockerfile 基于官方 python:3.13-slim-bookworm（arm64 真身），
+#   其余由仓库自带 install.sh 安装，产物是货真价实的 aarch64。
+#
+# 可选增强：
+#   - publish_release=true：把 tar.gz 发到 Release（拿到稳定 URL，若极空间支持「从 URL 导入」直接填链接）
+#   - 提供 DOCKERHUB_USERNAME/TOKEN/DH_IMAGE 三个 secret：额外推 Docker Hub，NAS 直接 pull（免下载）
+# ===============================================================
+
+name: build-we-mp-rss-arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "把镜像 tar.gz 发布到 GitHub Release（拿到稳定下载 URL）"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+
+permissions:
+  contents: write   # 仅 publish_release=true 时需要（创建 Release）
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（本仓库仅含构建配置）
+        uses: actions/checkout@v4
+
+      - name: Clone 上游源码（构建上下文主体）并覆盖 Dockerfile
+        run: |
+          git clone --depth 1 https://github.com/rachelos/we-mp-rss.git src
+          cp Dockerfile .dockerignore src/
+
+      - name: Set up QEMU（amd64 runner 上模拟构建 linux/arm64）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (linux/arm64, emulated) & load
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/arm64
+          load: true
+          tags: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest
+
+      - name: 校验产物架构（应输出 arm64 / linux）
+        run: |
+          docker image inspect ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
+            --format '{{.Architecture}} / {{.Os}}'
+          echo "== 关键依赖自检 =="
+          docker run --rm --entrypoint sh ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
+            -c 'VENV=/app/env_$(uname -m); "$VENV/bin/python" -c "import fastapi,uvicorn,playwright,sqlalchemy,lxml,PIL,bs4; print(\"依赖 import OK\")"; ls -d /app/env/driver/_$(uname -m)/webkit-* >/dev/null && echo "webkit 就位 OK"'
+
+      - name: Save image as tar.gz
+        run: |
+          docker save ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
+            | gzip -1 > we-mp-rss-arm64.tar.gz
+          ls -lh we-mp-rss-arm64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: we-mp-rss-arm64
+          path: we-mp-rss-arm64.tar.gz
+          retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "arm64-$(date +%Y%m%d-%H%M)" \
+            we-mp-rss-arm64.tar.gz \
+            --title "we-mp-rss arm64 离线镜像" \
+            --notes "真 arm64 构建产物，供极空间网页导入。tag: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
+
+      - name: Push to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' && secrets.DH_IMAGE != '' }}
+        env:
+          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_IMAGE: ${{ secrets.DH_IMAGE }}
+        run: |
+          echo "$DH_TOKEN" | docker login -u "$DH_USERNAME" --password-stdin
+          docker tag ghcr.nju.edu.cn/rachelos/we-mp-rss:latest "$DH_IMAGE"
+          docker push "$DH_IMAGE"
