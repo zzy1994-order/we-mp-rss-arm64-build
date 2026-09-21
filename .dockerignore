@@ -1,0 +1,23 @@
+.git
+.gitignore
+.idea
+.vscode
+.trae
+__pycache__
+*.pyc
+*.log
+.venv
+env
+data
+data1
+dist
+build
+ref
+web_ui/node_modules
+qtserver/node_modules
+# 以下为镜像内残留的「构建产物」，必须排除，否则会覆盖构建期重新生成的文件
+environment.sh
+docker_version.txt
+tmp_shot_qr.png
+*.bat
+
