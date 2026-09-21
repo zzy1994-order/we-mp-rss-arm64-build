@@ -55,13 +55,20 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build (linux/arm64, emulated) & load
-        uses: docker/build-push-action@v6
-        with:
-          context: src
-          platforms: linux/arm64
-          load: true
-          tags: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest
+      # 关键：跨平台（amd64 runner 构 arm64）不能用 build-push-action 的 load:true
+      # —— load 进 daemon 会因平台不符只装空壳，后续 docker save 得到空镜像。
+      # 正确做法：buildx 直接 --output type=tar 把真实镜像导出成 docker-archive 落盘。
+      - name: Build (linux/arm64) 并导出 docker-archive
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --tag ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
+            --output type=tar,dest=we-mp-rss-arm64.tar \
+            src
+          ls -lh we-mp-rss-arm64.tar
+
+      - name: 载入镜像用于校验（与最终交付同一份产物）
+        run: docker load -i we-mp-rss-arm64.tar
 
       - name: 校验产物架构（应输出 arm64 / linux）
         run: |
@@ -71,11 +78,14 @@ jobs:
           docker run --rm --entrypoint sh ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
             -c 'VENV=/app/env_$(uname -m); "$VENV/bin/python" -c "import fastapi,uvicorn,playwright,sqlalchemy,lxml,PIL,bs4; print(\"依赖 import OK\")"; ls -d /app/env/driver/_$(uname -m)/webkit-* >/dev/null && echo "webkit 就位 OK"'
 
-      - name: Save image as tar.gz
+      - name: 压缩为 tar.gz + 防护校验
         run: |
-          docker save ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
-            | gzip -1 > we-mp-rss-arm64.tar.gz
+          gzip -1 we-mp-rss-arm64.tar
           ls -lh we-mp-rss-arm64.tar.gz
+          # 防护：小于 100MB 视为构建异常（空壳镜像），主动失败，避免交付带病产物
+          SZ=$(stat -c%s we-mp-rss-arm64.tar.gz)
+          echo "artifact size = $SZ bytes"
+          if [ "$SZ" -lt 104857600 ]; then echo "!! 镜像过小，疑似构建异常"; exit 1; fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
