@@ -8,7 +8,7 @@
 # 用法：
 #   1) 建一个 GitHub 仓库（建议 public，便于 Release URL 导入），把本仓库 3 个文件放进去
 #   2) Actions → build-we-mp-rss-arm64 → Run workflow（可勾 publish_release）
-#   3) 跑完下载 Artifacts/Releases 里的 we-mp-rss-arm64.tar.gz（约 0.9–1.5 GB）
+#   3) 跑完下载 Artifacts/Releases 里的 we-mp-rss-arm64.tar.gz（约 1 GB）
 #   4) 极空间网页 → Docker → 镜像 → 导入 → 选这个 tar.gz
 #   5) compose 中 image 名是 ghcr.nju.edu.cn/rachelos/we-mp-rss:latest，导入后本地即存在该
 #      tag，docker compose up -d 不会联网。
@@ -17,9 +17,10 @@
 #   exec format error；本 Dockerfile 基于官方 python:3.13-slim-bookworm（arm64 真身），
 #   其余由仓库自带 install.sh 安装，产物是货真价实的 aarch64。
 #
-# 可选增强：
-#   - publish_release=true：把 tar.gz 发到 Release（拿到稳定 URL，若极空间支持「从 URL 导入」直接填链接）
-#   - 提供 DOCKERHUB_USERNAME/TOKEN/DH_IMAGE 三个 secret：额外推 Docker Hub，NAS 直接 pull（免下载）
+# 构建产物格式说明（重要）：
+#   - amd64 runner 无法直接把 arm64 镜像 load 进 docker daemon（跨平台 load 会得到空壳）。
+#   - 故用 `docker buildx build --output type=tar` 把真实镜像直接落盘为 OCI tar（2~3GB）。
+#   - 再用 skopeo 转成 docker-archive 格式（极空间「镜像导入」/ docker load 都认）。
 # ===============================================================
 
 name: build-we-mp-rss-arm64
@@ -57,8 +58,8 @@ jobs:
 
       # 关键：跨平台（amd64 runner 构 arm64）不能用 build-push-action 的 load:true
       # —— load 进 daemon 会因平台不符只装空壳，后续 docker save 得到空镜像。
-      # 正确做法：buildx 直接 --output type=tar 把真实镜像导出成 docker-archive 落盘。
-      - name: Build (linux/arm64) 并导出 docker-archive
+      # 正确做法：buildx 直接 --output type=tar 把真实镜像导出成 OCI tar 落盘（不依赖 daemon load）。
+      - name: Build (linux/arm64) 并导出 OCI tar（真实镜像落盘）
         run: |
           docker buildx build \
             --platform linux/arm64 \
@@ -67,10 +68,16 @@ jobs:
             src
           ls -lh we-mp-rss-arm64.tar
 
-      - name: 载入镜像用于校验（与最终交付同一份产物）
-        run: docker load -i we-mp-rss-arm64.tar
+      # 把 OCI tar 转成 docker-archive 格式（极空间「镜像导入」/ docker load 可识别）
+      - name: 安装 skopeo 并转为 docker-archive 格式
+        run: |
+          sudo apt-get update && sudo apt-get install -y skopeo
+          skopeo copy \
+            oci-archive:we-mp-rss-arm64.tar \
+            "docker-archive:we-mp-rss-arm64-docker.tar:ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
+          ls -lh we-mp-rss-arm64-docker.tar
 
-      - name: 校验产物架构（应输出 arm64 / linux）
+      - name: 校验产物（docker 格式应可正常 load + run）
         run: |
           docker image inspect ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
             --format '{{.Architecture}} / {{.Os}}'
@@ -80,10 +87,10 @@ jobs:
 
       - name: 压缩为 tar.gz + 防护校验
         run: |
-          gzip -1 we-mp-rss-arm64.tar
-          ls -lh we-mp-rss-arm64.tar.gz
+          gzip -1 we-mp-rss-arm64-docker.tar
+          ls -lh we-mp-rss-arm64-docker.tar.gz
           # 防护：小于 100MB 视为构建异常（空壳镜像），主动失败，避免交付带病产物
-          SZ=$(stat -c%s we-mp-rss-arm64.tar.gz)
+          SZ=$(stat -c%s we-mp-rss-arm64-docker.tar.gz)
           echo "artifact size = $SZ bytes"
           if [ "$SZ" -lt 104857600 ]; then echo "!! 镜像过小，疑似构建异常"; exit 1; fi
 
@@ -91,7 +98,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: we-mp-rss-arm64
-          path: we-mp-rss-arm64.tar.gz
+          path: we-mp-rss-arm64-docker.tar.gz
           retention-days: 14
 
       - name: Publish to GitHub Release
@@ -100,9 +107,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "arm64-$(date +%Y%m%d-%H%M)" \
-            we-mp-rss-arm64.tar.gz \
+            we-mp-rss-arm64-docker.tar.gz \
             --title "we-mp-rss arm64 离线镜像" \
-            --notes "真 arm64 构建产物，供极空间网页导入。tag: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
+            --notes "真 arm64 构建产物（docker-archive 格式），供极空间网页导入。tag: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
 
       - name: Push to Docker Hub (optional)
         # 注意：secrets 上下文不能出现在 if: 条件里（GitHub 限制），故改在 step 体内用 shell 判断
