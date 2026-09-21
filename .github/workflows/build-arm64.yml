@@ -17,13 +17,14 @@
 #   exec format error；本 Dockerfile 基于官方 python:3.13-slim-bookworm（arm64 真身），
 #   其余由仓库自带 install.sh 安装，产物是货真价实的 aarch64。
 #
-# 构建产物格式（重要，踩坑结论）：
+# 构建产物格式（踩坑结论，v5 终版）：
 #   - amd64 runner 无法直接把 arm64 镜像 load 进 docker daemon（跨平台 load 会得到空壳）。
-#   - buildx 直接 --output type=tar 出的是 OCI 格式，docker load 不认；skopeo 转 docker-archive
-#     又因镜像内 setcap 文件（gst-ptp-helper）的 xattr 在本环境 lsetxattr 被拒而失败。
-#   - 故采用「本地 registry 落盘」：build-push-action push:true 把真 arm64 镜像推到 runner 内
-#     临时 registry:2 → docker pull --platform linux/arm64 拉回 → docker save 导出为
-#     docker-archive（极空间「镜像导入」/ docker load 均认，且不涉及 xattr）。
+#   - buildx --output type=tar 出 OCI 格式，docker load 不认；skopeo 转 docker-archive 又因
+#     镜像内 setcap 文件（gst-ptp-helper）的 xattr 在本环境 lsetxattr 被拒而失败。
+#   - 本地 registry 方案因 buildx docker-container 驱动容器内 localhost≠宿主机而连不上。
+#   - 终版：build-push-action push:true 直接推到 **ghcr.io**（HTTPS，无网络/xattr 问题）→
+#     docker pull --platform linux/arm64 拉回 → docker save 导出为 docker-archive
+#     （极空间「镜像导入」/ docker load 均认，且不涉及 xattr）。
 # ===============================================================
 
 name: build-we-mp-rss-arm64
@@ -39,7 +40,8 @@ on:
     branches: [main]
 
 permissions:
-  contents: write   # 仅 publish_release=true 时需要（创建 Release）
+  contents: write   # 创建 Release
+  packages: write   # 推送镜像到 ghcr.io
 
 jobs:
   build:
@@ -59,21 +61,21 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 启动本地 registry（用于跨平台镜像落盘，规避 daemon load 空壳问题）
-        run: docker run -d -p 5000:5000 --name registry registry:2
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build (linux/arm64) 并推送到本地 registry
+      - name: Build (linux/arm64) 并推送到 GHCR
         uses: docker/build-push-action@v6
         with:
           context: src
           platforms: linux/arm64
           push: true
-          tags: localhost:5000/we-mp-rss:latest
+          tags: ghcr.io/${{ github.repository_owner }}/we-mp-rss-arm64:latest
 
       - name: 拉取并导出为 docker-archive（docker load / 极空间导入 可识别）
         run: |
-          docker pull --platform linux/arm64 localhost:5000/we-mp-rss:latest
-          docker tag localhost:5000/we-mp-rss:latest ghcr.nju.edu.cn/rachelos/we-mp-rss:latest
+          docker pull --platform linux/arm64 ghcr.io/${{ github.repository_owner }}/we-mp-rss-arm64:latest
+          docker tag ghcr.io/${{ github.repository_owner }}/we-mp-rss-arm64:latest ghcr.nju.edu.cn/rachelos/we-mp-rss:latest
           docker save ghcr.nju.edu.cn/rachelos/we-mp-rss:latest | gzip -1 > we-mp-rss-arm64.tar.gz
           ls -lh we-mp-rss-arm64.tar.gz
 
