@@ -17,10 +17,13 @@
 #   exec format error；本 Dockerfile 基于官方 python:3.13-slim-bookworm（arm64 真身），
 #   其余由仓库自带 install.sh 安装，产物是货真价实的 aarch64。
 #
-# 构建产物格式说明（重要）：
+# 构建产物格式（重要，踩坑结论）：
 #   - amd64 runner 无法直接把 arm64 镜像 load 进 docker daemon（跨平台 load 会得到空壳）。
-#   - 故用 `docker buildx build --output type=tar` 把真实镜像直接落盘为 OCI tar（2~3GB）。
-#   - 再用 skopeo 转成 docker-archive 格式（极空间「镜像导入」/ docker load 都认）。
+#   - buildx 直接 --output type=tar 出的是 OCI 格式，docker load 不认；skopeo 转 docker-archive
+#     又因镜像内 setcap 文件（gst-ptp-helper）的 xattr 在本环境 lsetxattr 被拒而失败。
+#   - 故采用「本地 registry 落盘」：build-push-action push:true 把真 arm64 镜像推到 runner 内
+#     临时 registry:2 → docker pull --platform linux/arm64 拉回 → docker save 导出为
+#     docker-archive（极空间「镜像导入」/ docker load 均认，且不涉及 xattr）。
 # ===============================================================
 
 name: build-we-mp-rss-arm64
@@ -56,28 +59,25 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 关键：跨平台（amd64 runner 构 arm64）不能用 build-push-action 的 load:true
-      # —— load 进 daemon 会因平台不符只装空壳，后续 docker save 得到空镜像。
-      # 正确做法：buildx 直接 --output type=tar 把真实镜像导出成 OCI tar 落盘（不依赖 daemon load）。
-      - name: Build (linux/arm64) 并导出 OCI tar（真实镜像落盘）
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --tag ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
-            --output type=tar,dest=we-mp-rss-arm64.tar \
-            src
-          ls -lh we-mp-rss-arm64.tar
+      - name: 启动本地 registry（用于跨平台镜像落盘，规避 daemon load 空壳问题）
+        run: docker run -d -p 5000:5000 --name registry registry:2
 
-      # 把 OCI tar 转成 docker-archive 格式（极空间「镜像导入」/ docker load 可识别）
-      - name: 安装 skopeo 并转为 docker-archive 格式
-        run: |
-          sudo apt-get update && sudo apt-get install -y skopeo
-          skopeo copy \
-            oci-archive:we-mp-rss-arm64.tar \
-            "docker-archive:we-mp-rss-arm64-docker.tar:ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
-          ls -lh we-mp-rss-arm64-docker.tar
+      - name: Build (linux/arm64) 并推送到本地 registry
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/arm64
+          push: true
+          tags: localhost:5000/we-mp-rss:latest
 
-      - name: 校验产物（docker 格式应可正常 load + run）
+      - name: 拉取并导出为 docker-archive（docker load / 极空间导入 可识别）
+        run: |
+          docker pull --platform linux/arm64 localhost:5000/we-mp-rss:latest
+          docker tag localhost:5000/we-mp-rss:latest ghcr.nju.edu.cn/rachelos/we-mp-rss:latest
+          docker save ghcr.nju.edu.cn/rachelos/we-mp-rss:latest | gzip -1 > we-mp-rss-arm64.tar.gz
+          ls -lh we-mp-rss-arm64.tar.gz
+
+      - name: 校验产物
         run: |
           docker image inspect ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
             --format '{{.Architecture}} / {{.Os}}'
@@ -85,20 +85,17 @@ jobs:
           docker run --rm --entrypoint sh ghcr.nju.edu.cn/rachelos/we-mp-rss:latest \
             -c 'VENV=/app/env_$(uname -m); "$VENV/bin/python" -c "import fastapi,uvicorn,playwright,sqlalchemy,lxml,PIL,bs4; print(\"依赖 import OK\")"; ls -d /app/env/driver/_$(uname -m)/webkit-* >/dev/null && echo "webkit 就位 OK"'
 
-      - name: 压缩为 tar.gz + 防护校验
+      - name: 防护校验 + 上传
         run: |
-          gzip -1 we-mp-rss-arm64-docker.tar
-          ls -lh we-mp-rss-arm64-docker.tar.gz
-          # 防护：小于 100MB 视为构建异常（空壳镜像），主动失败，避免交付带病产物
-          SZ=$(stat -c%s we-mp-rss-arm64-docker.tar.gz)
+          SZ=$(stat -c%s we-mp-rss-arm64.tar.gz)
           echo "artifact size = $SZ bytes"
           if [ "$SZ" -lt 104857600 ]; then echo "!! 镜像过小，疑似构建异常"; exit 1; fi
-
+          ls -lh we-mp-rss-arm64.tar.gz
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: we-mp-rss-arm64
-          path: we-mp-rss-arm64-docker.tar.gz
+          path: we-mp-rss-arm64.tar.gz
           retention-days: 14
 
       - name: Publish to GitHub Release
@@ -107,7 +104,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "arm64-$(date +%Y%m%d-%H%M)" \
-            we-mp-rss-arm64-docker.tar.gz \
+            we-mp-rss-arm64.tar.gz \
             --title "we-mp-rss arm64 离线镜像" \
             --notes "真 arm64 构建产物（docker-archive 格式），供极空间网页导入。tag: ghcr.nju.edu.cn/rachelos/we-mp-rss:latest"
 
